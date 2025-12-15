@@ -22,7 +22,7 @@ WG_MARKER="$WG_DIR/.installed_by_script"
 
 # Check if required packages are installed
 missing_dependencies() {
-    for pkg in wg iptables qrencode; do
+    for pkg in wg iptables qrencode curl; do
         if ! command -v "$pkg" &>/dev/null; then
             return 0
         fi
@@ -95,7 +95,7 @@ install_wireguard() {
     WG_CONFIG="$WG_DIR/wg0.conf"
 
     echo -e "\n${BLUE}WireGuard not found or missing dependencies. Installing required packages...${NC}\n"
-    apt update && apt install -y wireguard qrencode iptables
+    apt update && apt install -y wireguard qrencode iptables curl
 
     echo -e "\n${GREEN}WireGuard and required packages have been installed successfully.${NC}\n"
 
@@ -325,7 +325,7 @@ uninstall_wireguard() {
     fi
     systemctl stop wg-quick@wg0 || true
     systemctl disable wg-quick@wg0 || true
-    apt remove --purge -y wireguard qrencode && apt autoremove -y
+    apt remove --purge -y wireguard qrencode curl && apt autoremove -y
     rm -rf "$WG_DIR"
     # Remove only iptables rules with our comment from running config
     iptables-save | grep -v WG_SCRIPT_MANAGED | iptables-restore
