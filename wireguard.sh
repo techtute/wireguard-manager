@@ -16,6 +16,11 @@ if [ ! -f /etc/debian_version ]; then
     exit 1
 fi
 
+if [ "$EUID" -ne 0 ]; then
+    echo -e "\n${RED}Please run this script as root (sudo).${NC}\n"
+    exit 1
+fi
+
 WG_DIR="/etc/wireguard"
 WG_CLIENT_DIR="$WG_DIR/clients"
 WG_MARKER="$WG_DIR/.installed_by_script"
@@ -42,7 +47,8 @@ pre_existing_check() {
     fi
     # Only check iptables if installed
     if command -v iptables &>/dev/null; then
-        if iptables -S | grep -qv 'WG_SCRIPT_MANAGED'; then
+        # Only look at actual rules, the default -P policy lines are always there
+        if iptables -S | grep '^-A' | grep -qv 'WG_SCRIPT_MANAGED'; then
             if [ ! -e "$WG_MARKER" ] && [ -z "$WG_IGNORE_IPTABLES_CHECK" ]; then
                 echo -e "\n${YELLOW}Existing iptables rules detected that were not set by this script.${NC}"
                 echo -e "${YELLOW}These rules may conflict with rules added by this script.${NC}"
@@ -94,14 +100,26 @@ install_wireguard() {
 
     WG_CONFIG="$WG_DIR/wg0.conf"
 
+    # Mark the directory as ours right away so a failed install can be re-run or uninstalled
+    umask 077
+    mkdir -p "$WG_DIR"
+    touch "$WG_MARKER"
+
+    # Remember which packages we install so uninstall only removes those
+    if [ ! -f "$WG_DIR/.packages" ]; then
+        for pkg in wireguard wireguard-tools qrencode curl; do
+            if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+                echo "$pkg"
+            fi
+        done > "$WG_DIR/.packages"
+    fi
+
     echo -e "\n${BLUE}WireGuard not found or missing dependencies. Installing required packages...${NC}\n"
     apt update && apt install -y wireguard qrencode iptables curl
 
     echo -e "\n${GREEN}WireGuard and required packages have been installed successfully.${NC}\n"
 
     echo -e "${BLUE}Generating server keys...${NC}"
-    umask 077
-    mkdir -p "$WG_DIR"
     mkdir -p "$WG_CLIENT_DIR"
     chmod 700 "$WG_CLIENT_DIR"
     wg genkey | tee "$WG_DIR/privatekey" | wg pubkey > "$WG_DIR/publickey"
@@ -135,7 +153,6 @@ EOF
 
     # Save interface selection for later use
     echo "$INTERFACE" > "$WG_DIR/.interface"
-    touch "$WG_MARKER"
 
     # Add rules to /etc/iptables/rules.v4 if it exists
     if [ -f /etc/iptables/rules.v4 ]; then
@@ -150,8 +167,6 @@ EOF
         if ! grep -q "\-A FORWARD \-i $INTERFACE \-o wg0 \-j ACCEPT" /etc/iptables/rules.v4; then
             sed -i "/\*filter/a -A FORWARD -i $INTERFACE -o wg0 -j ACCEPT -m comment --comment WG_SCRIPT_MANAGED" /etc/iptables/rules.v4
         fi
-        # Restore iptables rules from rules.v4
-        iptables-restore < /etc/iptables/rules.v4
     fi
 
     echo -e "\n${GREEN}WireGuard server setup is complete.${NC}\n"
@@ -182,18 +197,8 @@ add_client() {
         fi
     done
 
-    CLIENT_DIR="$WG_CLIENT_DIR/$CLIENT_NAME"
-    mkdir -p "$CLIENT_DIR"
-    chmod 700 "$CLIENT_DIR"
-
-    umask 077
-    wg genkey | tee "$CLIENT_DIR/privatekey" | wg pubkey > "$CLIENT_DIR/publickey"
-
-    CLIENT_PRIVATE_KEY=$(cat "$CLIENT_DIR/privatekey")
-    CLIENT_PUBLIC_KEY=$(cat "$CLIENT_DIR/publickey")
-
     WG_CONFIG="$WG_DIR/wg0.conf"
-    DEFAULT_PUBLIC_IP=$(curl -s ifconfig.me)
+    DEFAULT_PUBLIC_IP=$(curl -4 -s --max-time 5 ifconfig.me || true)
     read -rp "$(echo -e "${CYAN}Enter server endpoint public IP (default: $DEFAULT_PUBLIC_IP, or E to exit): ${NC}")" SERVER_PUBLIC_IP
     if [[ "$SERVER_PUBLIC_IP" =~ ^[Ee]$ ]]; then
         return
@@ -205,9 +210,10 @@ add_client() {
     fi
 
     USED_IPS=$(grep -oP '10\.16\.0\.\d+' "$WG_CONFIG" || true)
+    CLIENT_IP=""
     for i in {2..254}; do
-        CLIENT_IP="10.16.0.$i"
-        if ! echo "$USED_IPS" | grep -q "$CLIENT_IP"; then
+        if ! grep -qxF "10.16.0.$i" <<< "$USED_IPS"; then
+            CLIENT_IP="10.16.0.$i"
             break
         fi
     done
@@ -216,6 +222,16 @@ add_client() {
         echo -e "${RED}No available IPs in the 10.16.0.0/24 subnet.${NC}\n"
         return
     fi
+
+    CLIENT_DIR="$WG_CLIENT_DIR/$CLIENT_NAME"
+    mkdir -p "$CLIENT_DIR"
+    chmod 700 "$CLIENT_DIR"
+
+    umask 077
+    wg genkey | tee "$CLIENT_DIR/privatekey" | wg pubkey > "$CLIENT_DIR/publickey"
+
+    CLIENT_PRIVATE_KEY=$(cat "$CLIENT_DIR/privatekey")
+    CLIENT_PUBLIC_KEY=$(cat "$CLIENT_DIR/publickey")
 
     cat > "$CLIENT_DIR/$CLIENT_NAME.conf" <<EOF
 [Interface]
@@ -262,7 +278,7 @@ delete_client() {
     fi
 
     # Remove the [Peer] block for this client using the comment markers
-    sed -i "/# BEGIN $CLIENT_NAME/,/# END $CLIENT_NAME/d" "$WG_DIR/wg0.conf"
+    sed -i "/^# BEGIN $CLIENT_NAME\$/,/^# END $CLIENT_NAME\$/d" "$WG_DIR/wg0.conf"
 
     rm -rf "$CLIENT_DIR"
     systemctl restart wg-quick@wg0
@@ -285,7 +301,7 @@ manage_clients() {
     if [[ "$CLIENT_NAME" =~ ^[Ee]$ ]]; then
         return
     fi
-    if [ ! -d "$WG_CLIENT_DIR/$CLIENT_NAME" ]; then
+    if [[ ! "$CLIENT_NAME" =~ ^[a-zA-Z0-9_-]+$ ]] || [ ! -d "$WG_CLIENT_DIR/$CLIENT_NAME" ]; then
         echo -e "\n${YELLOW}Invalid client name. Returning to the main menu.${NC}\n"
         return
     fi
@@ -298,6 +314,10 @@ manage_clients() {
         read -rp "$(echo -e "${CYAN}Choose an option: ${NC}")" OPTION
         case "${OPTION,,}" in
             q)
+                if [ ! -f "$WG_CLIENT_DIR/$CLIENT_NAME/$CLIENT_NAME.conf" ]; then
+                    echo -e "\n${YELLOW}No configuration file found for $CLIENT_NAME. Delete it and add it again.${NC}"
+                    continue
+                fi
                 echo -e "\n${BLUE}Generating QR code for $CLIENT_NAME...${NC}\n"
                 qrencode -t ansiutf8 < "$WG_CLIENT_DIR/$CLIENT_NAME/$CLIENT_NAME.conf"
                 echo -e "\n${CYAN}Configuration file path: $WG_CLIENT_DIR/$CLIENT_NAME/$CLIENT_NAME.conf${NC}\n"
@@ -325,7 +345,15 @@ uninstall_wireguard() {
     fi
     systemctl stop wg-quick@wg0 || true
     systemctl disable wg-quick@wg0 || true
-    apt remove --purge -y wireguard qrencode curl && apt autoremove -y
+    # Older installs have no package list, the script always installed wireguard there
+    if [ -f "$WG_DIR/.packages" ]; then
+        PKGS=$(cat "$WG_DIR/.packages")
+    else
+        PKGS="wireguard wireguard-tools"
+    fi
+    if [ -n "$PKGS" ]; then
+        apt remove --purge -y $PKGS
+    fi
     rm -rf "$WG_DIR"
     # Remove only iptables rules with our comment from running config
     iptables-save | grep -v WG_SCRIPT_MANAGED | iptables-restore
@@ -343,7 +371,7 @@ uninstall_wireguard() {
 main_menu() {
     while true; do
         echo -e "\n${CYAN}WireGuard Management Script${NC}\n"
-        if missing_dependencies; then
+        if missing_dependencies || [ ! -f "$WG_DIR/.interface" ]; then
             echo "(I)nstall WireGuard and Configure Server"
             echo "(E)xit"
             read -rp "$(echo -e "${CYAN}Choose an option: ${NC}")" OPTION
