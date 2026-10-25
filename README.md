@@ -25,13 +25,16 @@ A simple Bash script to install, configure, and manage a WireGuard VPN server an
 
 ## Usage
 
-1. **Download the script.**
+1. **Download the latest release:**
+    ```bash
+    wget https://github.com/techtute/wireguard-manager/releases/latest/download/wireguard.sh
+    ```
 2. **Run the script as root:**
     ```bash
     chmod +x wireguard.sh
     sudo ./wireguard.sh
     ```
-3. **Follow the interactive menu** to install WireGuard, add clients, manage clients, or uninstall.
+3. **Follow the interactive menu** to install WireGuard, add clients, manage clients, check status, or uninstall.
 
 ---
 
