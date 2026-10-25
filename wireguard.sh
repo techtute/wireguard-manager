@@ -255,7 +255,7 @@ AllowedIPs = $CLIENT_IP/32
 # END $CLIENT_NAME
 EOF
 
-    systemctl restart wg-quick@wg0
+    wg syncconf wg0 <(wg-quick strip wg0) || systemctl restart wg-quick@wg0
     echo -e "\n${GREEN}Client $CLIENT_NAME added successfully!${NC}\n"
     echo -e "${CYAN}Configuration file path: $CLIENT_DIR/$CLIENT_NAME.conf${NC}\n"
     qrencode -t ansiutf8 < "$CLIENT_DIR/$CLIENT_NAME.conf"
@@ -277,11 +277,18 @@ delete_client() {
         return
     fi
 
+    echo -e "\n${RED}This removes $CLIENT_NAME and its config. The device will lose access until it is added again as a new client.${NC}"
+    read -rp "$(echo -e "${CYAN}Delete $CLIENT_NAME? [y/N]: ${NC}")" CONFIRM
+    if [[ ! "${CONFIRM,,}" =~ ^(y|yes)$ ]]; then
+        echo -e "\n${GREEN}Delete cancelled.${NC}"
+        return
+    fi
+
     # Remove the [Peer] block for this client using the comment markers
     sed -i "/^# BEGIN $CLIENT_NAME\$/,/^# END $CLIENT_NAME\$/d" "$WG_DIR/wg0.conf"
 
     rm -rf "$CLIENT_DIR"
-    systemctl restart wg-quick@wg0
+    wg syncconf wg0 <(wg-quick strip wg0) || systemctl restart wg-quick@wg0
     echo -e "\n${GREEN}Client $CLIENT_NAME deleted successfully!${NC}\n"
     read -rp "$(echo -e "${CYAN}Press Enter to return to the main menu...${NC}")"
 }
@@ -337,11 +344,90 @@ manage_clients() {
     done
 }
 
+# Bytes to KiB/MiB/GiB
+human() {
+    numfmt --to=iec-i --suffix=B --format="%.1f" "$1"
+}
+
+# Live CPU, RAM, network and client view, refreshes every 5 seconds
+monitor() {
+    local iface rx1 tx1 rx2 tx2 c1 i1 c2 i2 t1 t2 ms cpu mem key out now online total
+    local pub endpoint allowed hs prx ptx name ago seen
+    iface=$(cat "$WG_DIR/.interface")
+
+    read -r rx1 tx1 < <(awk -v i="$iface" '$1==i":"{print $2, $10}' /proc/net/dev) || true
+    read -r c1 i1 < <(awk '/^cpu /{idle=$5+$6; t=0; for(i=2;i<=NF;i++)t+=$i; print t, idle}' /proc/stat)
+    t1=$(date +%s%3N)
+    sleep 1
+
+    while true; do
+        read -r rx2 tx2 < <(awk -v i="$iface" '$1==i":"{print $2, $10}' /proc/net/dev) || true
+        read -r c2 i2 < <(awk '/^cpu /{idle=$5+$6; t=0; for(i=2;i<=NF;i++)t+=$i; print t, idle}' /proc/stat)
+        t2=$(date +%s%3N)
+
+        # Use the real time between samples, not the sleep length
+        ms=$(( t2 - t1 ))
+        [ "$ms" -gt 0 ] || ms=1
+        cpu=0
+        if [ $(( c2 - c1 )) -gt 0 ]; then
+            cpu=$(( 100 * ( (c2 - c1) - (i2 - i1) ) / (c2 - c1) ))
+        fi
+        mem=$(free -m | awk '/Mem:/{printf "%d/%dMB (%.0f%%)", $3, $2, $3/$2*100}')
+
+        out=$(printf "${YELLOW}CPU: %s%%  RAM: %s  NET(%s): down %s/s  up %s/s${NC}" \
+            "$cpu" "$mem" "$iface" \
+            "$(human $(( (rx2 - rx1) * 1000 / ms )))" "$(human $(( (tx2 - tx1) * 1000 / ms )))")
+        rx1=$rx2; tx1=$tx2; c1=$c2; i1=$i2; t1=$t2
+
+        now=$(date +%s)
+        online=0
+        total=0
+        # Peer lines: pubkey psk endpoint allowed-ips handshake rx tx keepalive
+        while IFS=$'\t' read -r pub _ endpoint allowed hs prx ptx _; do
+            total=$((total + 1))
+            name=$(grep -B2 -F "PublicKey = $pub" "$WG_DIR/wg0.conf" | sed -n 's/^# BEGIN //p')
+            if [ "$hs" -eq 0 ]; then
+                seen="never"
+            else
+                ago=$(( now - hs ))
+                if [ "$ago" -lt 180 ]; then
+                    online=$((online + 1))
+                fi
+                if [ "$ago" -lt 60 ]; then seen="${ago}s ago"
+                elif [ "$ago" -lt 3600 ]; then seen="$(( ago / 60 ))m ago"
+                elif [ "$ago" -lt 86400 ]; then seen="$(( ago / 3600 ))h ago"
+                else seen="$(( ago / 86400 ))d ago"
+                fi
+            fi
+            out+=$(printf "\n\n${CYAN}%s${NC}\n  endpoint: %s\n  allowed ips: %s\n  last handshake: %s\n  transfer: %s received, %s sent" \
+                "${name:-unknown}" "$endpoint" "$allowed" "$seen" "$(human "$prx")" "$(human "$ptx")")
+        done < <(wg show wg0 dump | tail -n +2)
+
+        printf '\033[H\033[2J'
+        printf '%s\n' "$out"
+        echo -e "\n${GREEN}$online of $total clients active in the last 3 minutes${NC}"
+        echo -e "${BLUE}Press Q to return to the main menu${NC}"
+
+        key=""
+        read -rsn1 -t 5 key || true
+        if [[ "${key,,}" == q ]]; then
+            break
+        fi
+    done
+}
+
 # Uninstall everything installed by this script except iptables
 uninstall_wireguard() {
     if [ ! -e "$WG_MARKER" ]; then
         echo -e "\n${RED}WireGuard was not installed by this script. Aborting uninstall.${NC}\n"
         exit 1
+    fi
+    echo -e "\n${RED}WARNING: This removes WireGuard, the server keys and ALL client configs.${NC}"
+    echo -e "${RED}Every client will have to be added and set up again. This cannot be undone.${NC}\n"
+    read -rp "$(echo -e "${CYAN}Uninstall WireGuard? [y/N]: ${NC}")" CONFIRM
+    if [[ ! "${CONFIRM,,}" =~ ^(y|yes)$ ]]; then
+        echo -e "\n${GREEN}Uninstall cancelled, nothing was removed.${NC}"
+        return
     fi
     systemctl stop wg-quick@wg0 || true
     systemctl disable wg-quick@wg0 || true
@@ -385,6 +471,7 @@ main_menu() {
             if ls -1 "$WG_CLIENT_DIR" 2>/dev/null | grep -q .; then
                 echo "(M)anage Clients"
             fi
+            echo "(S)tatus Monitor"
             if [ -e "$WG_MARKER" ]; then
                 echo "(U)ninstall WireGuard and remove all configs"
             fi
@@ -393,9 +480,10 @@ main_menu() {
             case "${OPTION,,}" in
                 a) add_client ;;
                 m) manage_clients ;;
+                s) monitor ;;
                 u) uninstall_wireguard ;;
                 e) exit 0 ;;
-                *) echo -e "${YELLOW}Invalid option. Please enter A, M, U, or E.${NC}" ;;
+                *) echo -e "${YELLOW}Invalid option. Please enter A, M, S, U, or E.${NC}" ;;
             esac
         fi
     done
