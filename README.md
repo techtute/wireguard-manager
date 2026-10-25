@@ -9,6 +9,7 @@ A simple Bash script to install, configure, and manage a WireGuard VPN server an
 - **Automated installation** of WireGuard, iptables, and qrencode
 - **Interactive setup**: choose outbound interface, generate server keys, and configure firewall rules
 - **Easy client management**: add/remove clients, generate configs and QR codes for mobile devices
+- **Status monitor**: live CPU, RAM, network rate and connected clients by name
 - **Safe uninstall**: removes only script-managed firewall rules and WireGuard configs, leaving existing firewall rules untouched
 - **Tested on**: AWS EC2 and Oracle Cloud Infrastructure (OCI) instances running Debian/Ubuntu
 
